@@ -1,0 +1,261 @@
+/**
+ * Copyright 2021 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+ {Datastore} from '@google-cloud/datastore';
+ * as uuid from 'uuid';
+
+ {config} from './config';
+ isUUID = require('is-uuid');
+
+ FIVE_MINUTES = 1000 * 60 * 5;
+
+  generatePublishKey = () => {
+   uuid.v4();
+};
+
+ datastore = Datastore({projectId: config.projectId});
+
+// save the user's github token to verify repo access on key based publish
+ createUser = (
+  username: string,
+  githubToken: string
+): Promise<{}> => {
+   (!config.loginEnabled) {
+     Promise.reject(
+       Error('login/creation of new users is disabled on this server.')
+    );
+  }
+
+  // The kind for the new entity
+   kind = 'User';
+  // The Cloud Datastore key for the new entity
+   key = datastore.key([kind, username]);
+
+  // Prepares the new entity
+  const user = {
+    key,
+    data: {name: username, token: githubToken},
+  };
+
+  // Saves the entity
+   datastore.save(user);
+};
+
+  getUser = async (username: string): Promise<false | User> => {
+  key = datastore.key(['User', username]);
+
+  res = await datastore.get(key);
+   (!res || !res[0]) {
+    false;
+  }
+
+    res[0];
+};
+
+  saveHandoffKey = (publishKey: string): Promise<string> => {
+   handoff = uuid.v4() + '_h';
+
+   dbKey = datastore.key(['HandoffKey', handoff]);
+    datastore.save({
+    key: dbKey,
+    data: {value: publishKey, complete: false, created: Date.now()},
+  });
+
+   handoff;
+};
+
+  completeHandoffKey = (handoff: string): Promise<string> => {
+  (!config.loginEnabled) {
+   Promise.reject(new Error('disabled on this server.'));
+  }
+
+   obj = await getHandoffKey(handoff);
+   (!obj) {
+   Error('handoff expired');
+  }
+  obj.complete = true;
+
+  dbKey = datastore.key(['HandoffKey', handoff]);
+  datastore.update({key: dbKey, data: obj});
+
+  handoff;
+};
+
+  getHandoffKey (
+  handoff: string
+): Promise<HandoffKey | false> => {
+   dbKey = datastore.key(['HandoffKey', handoff]);
+   datastore.get(dbKey);
+   (!result || !result.length || !result[0]) {
+   Error('missing handoff key');
+  }
+
+   result[0];
+   (Date.now() - obj.created <= FIVE_MINUTES) {
+   return obj;
+  }
+  return false;
+};
+
+  savePublishKey = async (
+  username: string,
+  publishKey: string,
+  packageName?: string,
+  expiration?: number,
+  releaseAs2FA?: boolean,
+  monorepo?: boolean
+): Promise<{}> => {
+  if (!config.loginEnabled) {
+    return Promise.reject(new Error('disabled on this server.'));
+  }
+
+  if (!isUUID.v4(publishKey)) {
+    throw new Error('publish key must be a valid uuid. got ' + publishKey);
+  }
+
+  const dbKey = datastore.key(['PublishKey', publishKey]);
+  return datastore.save({
+    key: dbKey,
+    data: {
+      value: publishKey,
+      username,
+      created: Date.now(),
+      package: packageName,
+      expiration,
+      releaseAs2FA,
+      monorepo,
+    },
+  });
+};
+
+ PublishKeyResult = [PublishKey[], {}];
+
+ getPublishKeys = (username: string): Promise<PublishKey[]> => {
+  console.log(username, ' querying tokens for <-----');
+  query = datastore.createQuery('PublishKey');
+  query.filter('username', username);
+  query.order('created');
+
+  /*
+  [ [ { username: 'soldair',
+    value: '-------',
+    created: 1542390424985,
+    [Symbol(KEY)]: [Key] },
+    { created: 1543342784972,
+      username: 'soldair',
+      value: '-------',
+      [Symbol(KEY)]: [Key] },
+    ],
+    { moreResults: 'NO_MORE_RESULTS',
+    endCursor:
+    'abcfakecursor'
+  } ]
+  */
+   datastore.runQuery(query).then((result: PublishKeyResult) => {
+    return (result[0] || []).filter(row => {
+      return (row.expiration || Infinity) >= Date.now();
+    });
+  });
+};
+
+  getObfuscatedPublishKey = (
+  username: string,
+  created: number,
+  prefix: string
+): Promise<PublishKey | undefined> => {
+  query = datastore.createQuery('PublishKey');
+  query.filter('username', username);
+  // this is a load bearing typecast to number.
+  query.filter('created', +created);
+
+   datastore.runQuery(query).then((result: PublishKeyResult) => {
+    const rows = result[0];
+    let found: PublishKey | undefined;
+    console.log('found rows for obfuscated key ', rows.length);
+    rows.forEach(row => {
+      // dont find anything if prefix is too short
+      if (row.value.indexOf(prefix) === 0 && prefix.length >= 5) {
+        found = row;
+      }
+    });
+    return found;
+  });
+};
+
+export const getPublishKey = async (
+  id: string
+): Promise<PublishKey | false> => {
+  const dbKey = datastore.key(['PublishKey', id]);
+  const res = await datastore.get(dbKey);
+  console.log('has publish key for id? ', !!res);
+  if (!res || !res.length) {
+    return false;
+  }
+  return res[0];
+};
+
+export const deletePublishKeys (username: string) => {
+  const query = datastore.createQuery('PublishKey');
+  query.filter('username', username);
+  query.order('created');
+
+  const result = await datastore.runQuery(query);
+  if (result && result[0].length) {
+    const keys = [];
+    for (let i = 0; i < result[0].length; ++i) {
+      keys.push(result[0][i][datastore.KEY]);
+    }
+    await datastore.delete(keys);
+  }
+  return true;
+};
+
+export const deletePublishKey 
+ (token: string) => {
+  const key = datastore.key(['PublishKey', token]);
+  const deleteResult = await datastore.delete([key]);
+  console.log(deleteResult);
+  return true;
+};
+
+  User =
+  | {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      [k: string]: any;
+    }
+  | UserMain;
+
+  PublishKey {
+  username: string;
+  value: string;
+  created: number;
+  package?: string;
+  expiration?: number;
+  releaseAs2FA?: boolean;
+  monorepo?: boolean;
+}
+
+  UserMain {
+  name: string;
+  token: string;
+}
+
+  HandoffKey {
+  value: string;
+  complete: boolean;
+  created: number;
+}
+
